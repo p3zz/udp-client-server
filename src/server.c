@@ -7,11 +7,13 @@
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
+#define RESPONSE "Message received"
 
 int main() {
     int sockfd;
     struct sockaddr_in server_addr, client_addr;
     char buffer[BUFFER_SIZE];
+    char client_ip[INET_ADDRSTRLEN];
     socklen_t addr_len = sizeof(client_addr);
 
     // Create UDP socket
@@ -35,7 +37,6 @@ int main() {
 
     printf("Listening for UDP messages on port %d...\n", PORT);
 
-    // Infinite loop to receive messages
     while (1) {
         ssize_t n = recvfrom(sockfd, buffer, BUFFER_SIZE - 1, 0,
                              (struct sockaddr *)&client_addr, &addr_len);
@@ -44,12 +45,20 @@ int main() {
             continue;
         }
 
-        buffer[n] = '\0';  // Null-terminate the received message
-        char client_ip[INET_ADDRSTRLEN];
+        buffer[n] = '\0';  // Null-terminate
         inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
 
         printf("Received message from %s:%d: %s\n",
                client_ip, ntohs(client_addr.sin_port), buffer);
+
+        // Send response
+        if (sendto(sockfd, RESPONSE, strlen(RESPONSE), 0,
+                   (struct sockaddr *)&client_addr, addr_len) < 0) {
+            perror("sendto (response) failed");
+        } else {
+            printf("Sent response to %s:%d\n",
+                   client_ip, ntohs(client_addr.sin_port));
+        }
     }
 
     close(sockfd);
