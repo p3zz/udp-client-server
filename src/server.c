@@ -4,10 +4,33 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <pthread.h>
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
 #define RESPONSE "Message received"
+
+typedef struct{
+    int value;
+    pthread_mutex_t lock;
+}shared_data;
+
+static shared_data data = { .value = 0, .lock = PTHREAD_MUTEX_INITIALIZER };
+
+void *thread_body(void *arg) {
+    shared_data *shared = (shared_data *)arg;
+
+    while (1) {
+        pthread_mutex_lock(&shared->lock);
+        shared->value++;
+        shared->value %= 10;
+        pthread_mutex_unlock(&shared->lock);
+
+        sleep(2); // simulate work / wait time
+    }
+
+    return NULL;
+}
 
 int main() {
     int sockfd;
@@ -15,6 +38,12 @@ int main() {
     char buffer[BUFFER_SIZE];
     char client_ip[INET_ADDRSTRLEN];
     socklen_t addr_len = sizeof(client_addr);
+    pthread_t tid;
+
+    if (pthread_create(&tid, NULL, thread_body, &data) != 0) {
+        perror("Failed to create thread");
+        return 1;
+    }
 
     // Create UDP socket
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
@@ -51,8 +80,13 @@ int main() {
         printf("Received message from %s:%d: %s\n",
                client_ip, ntohs(client_addr.sin_port), buffer);
 
+        int value = 0;
+        pthread_mutex_lock(&data.lock);
+        value = data.value;
+        pthread_mutex_unlock(&data.lock);
+
         // Send response
-        if (sendto(sockfd, RESPONSE, strlen(RESPONSE), 0,
+        if (sendto(sockfd, &value, sizeof(value), 0,
                    (struct sockaddr *)&client_addr, addr_len) < 0) {
             perror("sendto (response) failed");
         } else {
