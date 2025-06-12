@@ -45,6 +45,8 @@ int has_ip_address(int socket_fd, const char *iface_name) {
         // Interface probably doesn't have an IP address
         return 1;
     }
+    struct sockaddr_in *ipaddr = (struct sockaddr_in *)&ifr.ifr_addr;
+    printf("Interface %s has IP: %s\n", iface_name, inet_ntoa(ipaddr->sin_addr));
     return 0; // Has IP
 }
 
@@ -148,6 +150,7 @@ int main() {
                        client_ip, ntohs(client_addr.sin_port));
             }
         }
+        // TODO send broadcast only to target interface
         else{
             printf("IP address is not configured for interface %s, sending response on UDP broadcast\n", if_name);
             // Enable broadcast        
