@@ -38,7 +38,7 @@ void *thread_body(void *arg) {
 int has_ip_address(int socket_fd, const char *iface_name) {
     struct ifreq ifr = {0};
 
-    strncpy(ifr.ifr_name, iface_name, IFNAMSIZ - 1);
+    strncpy(ifr.ifr_name, iface_name, IFNAMSIZ);
     ifr.ifr_name[IFNAMSIZ - 1] = '\0';
 
     if (ioctl(socket_fd, SIOCGIFADDR, &ifr) == -1) {
@@ -52,9 +52,11 @@ int main() {
     int sockfd;
     struct sockaddr_in server_addr, client_addr;
     char buffer[BUFFER_SIZE];
+    char control[CMSG_SPACE(sizeof(struct in_pktinfo))];
     char client_ip[INET_ADDRSTRLEN];
-    socklen_t addr_len = sizeof(client_addr);
+    char if_name[IFNAMSIZ] = {0}; // Buffer for interface name
     int broadcast_enable = 1;
+    int pkt_info_enable = 1;
     pthread_t tid;
 
     if (pthread_create(&tid, NULL, thread_body, &data) != 0) {
@@ -68,7 +70,16 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    const char interface[] = "enp34s0";
+    struct iovec iov = { .iov_base = buffer, .iov_len = sizeof(buffer) };
+    struct msghdr msg = {
+        .msg_name = &client_addr,
+        .msg_namelen = sizeof(client_addr),
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = control,
+        .msg_controllen = sizeof(control),
+    };
+
 
     // Set server address
     memset(&server_addr, 0, sizeof(server_addr));
@@ -78,6 +89,9 @@ int main() {
 
     if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
         perror("setsockopt(SO_BROADCAST) failed");
+    }
+    if (setsockopt(sockfd, IPPROTO_IP, IP_PKTINFO, &pkt_info_enable, sizeof(pkt_info_enable)) < 0) {
+        perror("setsockopt IP_PKTINFO");
     }
 
     // Bind socket to the address
@@ -90,11 +104,26 @@ int main() {
     printf("Listening for UDP messages on port %d...\n", PORT);
 
     while (1) {
-        ssize_t n = recvfrom(sockfd, buffer, BUFFER_SIZE - 1, 0,
-                             (struct sockaddr *)&client_addr, &addr_len);
+        ssize_t n = recvmsg(sockfd, &msg, 0);
         if (n < 0) {
             perror("recvfrom failed");
             continue;
+        }
+
+        struct in_pktinfo *pktinfo = NULL;
+        for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
+                pktinfo = (struct in_pktinfo *)CMSG_DATA(cmsg);
+                break;
+            }
+        }
+
+        if (pktinfo != NULL) {
+            if (if_indextoname(pktinfo->ipi_ifindex, if_name)) {
+                printf("Packet received on interface: %s (index %d)\n", if_name, pktinfo->ipi_ifindex);
+            } else {
+                perror("if_indextoname failed");
+            }
         }
 
         buffer[n] = '\0';  // Null-terminate
@@ -108,11 +137,11 @@ int main() {
         value = data.value;
         pthread_mutex_unlock(&data.lock);
 
-        if(has_ip_address(sockfd, interface) == 0){
-            printf("IP address is configured for interface %s, sending response on UDP unicast", (char*)interface);
+        if(has_ip_address(sockfd, if_name) == 0){
+            printf("IP address is configured for interface %s, sending response on UDP unicast\n", if_name);
             // Send response
             if (sendto(sockfd, &value, sizeof(value), 0,
-                       (struct sockaddr *)&client_addr, addr_len) < 0) {
+                       (struct sockaddr *)&client_addr, sizeof(client_addr)) < 0) {
                 perror("sendto (response) failed");
             } else {
                 printf("Sent response to %s:%d\n",
@@ -120,7 +149,7 @@ int main() {
             }
         }
         else{
-            printf("IP address is not configured for interface %s, sending response on UDP broadcast", (char*)interface);
+            printf("IP address is not configured for interface %s, sending response on UDP broadcast\n", if_name);
             // Enable broadcast        
             // Prepare broadcast address
             struct sockaddr_in broadcast_addr;
