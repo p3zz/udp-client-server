@@ -35,7 +35,7 @@ void *thread_body(void *arg) {
     return NULL;
 }
 
-int has_ip_address(int socket_fd, const char *iface_name) {
+int server_if_has_ip_address(int socket_fd, const char *iface_name) {
     struct ifreq ifr = {0};
 
     strncpy(ifr.ifr_name, iface_name, IFNAMSIZ);
@@ -50,57 +50,84 @@ int has_ip_address(int socket_fd, const char *iface_name) {
     return 0; // Has IP
 }
 
-int main() {
-    int sockfd;
-    struct sockaddr_in server_addr, client_addr;
-    char buffer[BUFFER_SIZE];
-    char control[CMSG_SPACE(sizeof(struct in_pktinfo))];
-    char client_ip[INET_ADDRSTRLEN];
-    char if_name[IFNAMSIZ] = {0}; // Buffer for interface name
+void server_configure_socket_address(struct sockaddr_in* server_addr){
+    // address family: internet
+    server_addr->sin_family = AF_INET;
+    // accept packets from any interface
+    server_addr->sin_addr.s_addr = INADDR_ANY;
+    // configure port to listen to
+    server_addr->sin_port = htons(PORT);
+}
+
+int server_configure_socket(int* socket_fd){
     int broadcast_enable = 1;
     int pkt_info_enable = 1;
-    pthread_t tid;
+    struct sockaddr_in server_addr = {0};
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if(sockfd < 0){
+        return 1;
+    }
+    if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
+        return 1;
+    }
+    if (setsockopt(sockfd, IPPROTO_IP, IP_PKTINFO, &pkt_info_enable, sizeof(pkt_info_enable)) < 0) {
+        return 1;
+    }
+    server_configure_socket_address(&server_addr);
+    // Bind socket to the address
+    if (bind(sockfd, (const struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        close(sockfd);
+        return 1;
+    }
+    *socket_fd = sockfd;
+    return 0;
+}
 
-    if (pthread_create(&tid, NULL, thread_body, &data) != 0) {
-        perror("Failed to create thread");
+int server_extract_if_from_msg(const struct msghdr* msg, char* if_name){
+    struct in_pktinfo *pktinfo = NULL;
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR((struct msghdr*)msg, cmsg)) {
+        if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
+            pktinfo = (struct in_pktinfo *)CMSG_DATA(cmsg);
+            break;
+        }
+    }
+
+    if (pktinfo == NULL) {
+        return 1;
+    }
+    
+    if(if_indextoname(pktinfo->ipi_ifindex, if_name) == 0) {
         return 1;
     }
 
-    // Create UDP socket
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        perror("socket creation failed");
-        exit(EXIT_FAILURE);
-    }
+    return 0;
+}
 
-    struct iovec iov = { .iov_base = buffer, .iov_len = sizeof(buffer) };
+int main() {
+    int sockfd = 0;
+    struct sockaddr_in client_addr = {0};
+    uint8_t client_buffer[BUFFER_SIZE];
+    char client_control[CMSG_SPACE(sizeof(struct in_pktinfo))];
+    char client_ip[INET_ADDRSTRLEN];
+    char if_name[IFNAMSIZ] = {0}; // Buffer for interface name
+    pthread_t tid;
+    struct iovec iov = { .iov_base = client_buffer, .iov_len = sizeof(client_buffer) };
     struct msghdr msg = {
         .msg_name = &client_addr,
         .msg_namelen = sizeof(client_addr),
         .msg_iov = &iov,
         .msg_iovlen = 1,
-        .msg_control = control,
-        .msg_controllen = sizeof(control),
+        .msg_control = client_control,
+        .msg_controllen = sizeof(client_control),
     };
 
-
-    // Set server address
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;  // Accept from any interface
-    server_addr.sin_port = htons(PORT);
-
-    if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
-        perror("setsockopt(SO_BROADCAST) failed");
-    }
-    if (setsockopt(sockfd, IPPROTO_IP, IP_PKTINFO, &pkt_info_enable, sizeof(pkt_info_enable)) < 0) {
-        perror("setsockopt IP_PKTINFO");
+    if(server_configure_socket(&sockfd) != 0){
+        perror("socket configuration failed");
     }
 
-    // Bind socket to the address
-    if (bind(sockfd, (const struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind failed");
-        close(sockfd);
-        exit(EXIT_FAILURE);
+    if (pthread_create(&tid, NULL, thread_body, &data) != 0) {
+        perror("Failed to create thread");
+        return 1;
     }
 
     printf("Listening for UDP messages on port %d...\n", PORT);
@@ -112,39 +139,31 @@ int main() {
             continue;
         }
 
-        struct in_pktinfo *pktinfo = NULL;
-        for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-            if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
-                pktinfo = (struct in_pktinfo *)CMSG_DATA(cmsg);
-                break;
-            }
+        if(server_extract_if_from_msg(&msg, if_name) == 0){
+            printf("Message coming from interface %s\n", if_name);
+        }else{
+            printf("Message coming from unknown interface\n");
+            exit(1);
         }
 
-        if (pktinfo != NULL) {
-            if (if_indextoname(pktinfo->ipi_ifindex, if_name)) {
-                printf("Packet received on interface: %s (index %d)\n", if_name, pktinfo->ipi_ifindex);
-            } else {
-                perror("if_indextoname failed");
-            }
-        }
-
-        buffer[n] = '\0';  // Null-terminate
+        client_buffer[n] = '\0';  // Null-terminate
         inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
 
         printf("Received message from %s:%d: %s\n",
-               client_ip, ntohs(client_addr.sin_port), buffer);
+               client_ip, ntohs(client_addr.sin_port), client_buffer);
 
         int value = 0;
         pthread_mutex_lock(&data.lock);
         value = data.value;
         pthread_mutex_unlock(&data.lock);
 
-        if(has_ip_address(sockfd, if_name) == 0){
+        if(server_if_has_ip_address(sockfd, if_name) == 0){
             printf("IP address is configured for interface %s, sending response on UDP unicast\n", if_name);
             // Send response
             if (sendto(sockfd, &value, sizeof(value), 0,
                        (struct sockaddr *)&client_addr, sizeof(client_addr)) < 0) {
                 perror("sendto (response) failed");
+                exit(1);
             } else {
                 printf("Sent response to %s:%d\n",
                        client_ip, ntohs(client_addr.sin_port));
