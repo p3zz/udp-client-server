@@ -35,8 +35,15 @@ void *thread_body(void *arg) {
     return NULL;
 }
 
-int server_if_has_ip_address(int socket_fd, const char *iface_name) {
+int server_if_has_ip_address(int socket_fd, int if_idx) {
     struct ifreq ifr = {0};
+    char iface_name[IFNAMSIZ] = {0};
+
+     // Convert index to name
+    if (if_indextoname(if_idx, iface_name) == NULL) {
+        perror("if_indextoname");
+        return -1; // Error converting index to name
+    }
 
     strncpy(ifr.ifr_name, iface_name, IFNAMSIZ);
     ifr.ifr_name[IFNAMSIZ - 1] = '\0';
@@ -83,7 +90,7 @@ int server_configure_socket(int* socket_fd){
     return 0;
 }
 
-int server_extract_if_from_msg(const struct msghdr* msg, char* if_name){
+int server_extract_if_from_msg(const struct msghdr* msg, int* if_idx){
     struct in_pktinfo *pktinfo = NULL;
     for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR((struct msghdr*)msg, cmsg)) {
         if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
@@ -95,11 +102,70 @@ int server_extract_if_from_msg(const struct msghdr* msg, char* if_name){
     if (pktinfo == NULL) {
         return 1;
     }
-    
-    if(if_indextoname(pktinfo->ipi_ifindex, if_name) == 0) {
+
+    *if_idx = pktinfo->ipi_ifindex;
+
+    return 0;
+}
+
+int server_send_broadcast_data(int sockfd, in_port_t port, int if_idx, const uint8_t* data, int data_len){
+    uint8_t client_control[CMSG_SPACE(sizeof(struct in_pktinfo))] = {0};
+
+    struct sockaddr_in broadcast_addr = {
+        .sin_addr = {
+            .s_addr = htonl(INADDR_BROADCAST)
+        },
+        .sin_family = AF_INET,
+        .sin_port = port
+    };
+
+    // craft data to send
+    struct iovec dest_iov = {
+        .iov_base = (uint8_t*)data,
+        .iov_len = data_len
+    };
+
+    struct msghdr dest_msg = {
+        .msg_name = &broadcast_addr,
+        .msg_namelen = sizeof(broadcast_addr),
+        .msg_iov = &dest_iov,
+        .msg_iovlen = 1,
+        .msg_control = client_control,
+        .msg_controllen = sizeof(client_control)
+    };
+
+    // Setup control message for specifying interface
+    struct cmsghdr *dest_cmsg = CMSG_FIRSTHDR(&dest_msg);
+    if(dest_cmsg == NULL){
         return 1;
     }
+    dest_cmsg->cmsg_level = IPPROTO_IP;
+    dest_cmsg->cmsg_type = IP_PKTINFO;
+    dest_cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
 
+    struct in_pktinfo dest_pktinfo = {0};
+
+    dest_pktinfo.ipi_ifindex = if_idx;
+    memcpy(CMSG_DATA(dest_cmsg), &dest_pktinfo, sizeof(dest_pktinfo));
+
+    dest_msg.msg_controllen = sizeof(client_control);
+
+    // Send the packet
+    if (sendmsg(sockfd, &dest_msg, 0) < 0) {
+        return 1;
+    }
+    return 0;
+}
+
+int server_send_unicast_data(int sockfd, struct in_addr sin_addr, in_port_t port, const uint8_t* data, int data_len){
+    struct sockaddr_in addr = {
+        .sin_addr = sin_addr,
+        .sin_family = AF_INET,
+        .sin_port = port
+    };
+    if (sendto(sockfd, data, data_len, 0, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        return 1;
+    }
     return 0;
 }
 
@@ -109,7 +175,7 @@ int main() {
     uint8_t client_buffer[BUFFER_SIZE];
     char client_control[CMSG_SPACE(sizeof(struct in_pktinfo))];
     char client_ip[INET_ADDRSTRLEN];
-    char if_name[IFNAMSIZ] = {0}; // Buffer for interface name
+
     pthread_t tid;
     struct iovec iov = { .iov_base = client_buffer, .iov_len = sizeof(client_buffer) };
     struct msghdr msg = {
@@ -139,8 +205,9 @@ int main() {
             continue;
         }
 
-        if(server_extract_if_from_msg(&msg, if_name) == 0){
-            printf("Message coming from interface %s\n", if_name);
+        int if_idx = 0;
+        if(server_extract_if_from_msg(&msg, &if_idx) == 0){
+            printf("Message coming from interface %d\n", if_idx);
         }else{
             printf("Message coming from unknown interface\n");
             exit(1);
@@ -157,34 +224,22 @@ int main() {
         value = data.value;
         pthread_mutex_unlock(&data.lock);
 
-        if(server_if_has_ip_address(sockfd, if_name) == 0){
-            printf("IP address is configured for interface %s, sending response on UDP unicast\n", if_name);
+        if(server_if_has_ip_address(sockfd, if_idx) == 0){
+            printf("IP address is configured for interface %d, sending response on UDP unicast\n", if_idx);
             // Send response
+            if(server_send_unicast_data(sockfd, client_addr.sin_addr, client_addr.sin_port, (uint8_t*)&value, sizeof(value)))
             if (sendto(sockfd, &value, sizeof(value), 0,
                        (struct sockaddr *)&client_addr, sizeof(client_addr)) < 0) {
                 perror("sendto (response) failed");
                 exit(1);
-            } else {
-                printf("Sent response to %s:%d\n",
-                       client_ip, ntohs(client_addr.sin_port));
             }
         }
         // TODO send broadcast only to target interface
         else{
-            printf("IP address is not configured for interface %s, sending response on UDP broadcast\n", if_name);
-            // Enable broadcast        
-            // Prepare broadcast address
-            struct sockaddr_in broadcast_addr;
-            memset(&broadcast_addr, 0, sizeof(broadcast_addr));
-            broadcast_addr.sin_family = AF_INET;
-            broadcast_addr.sin_port = client_addr.sin_port; // use same port as client
-            broadcast_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST); // 255.255.255.255
-        
-            if (sendto(sockfd, &value, sizeof(value), 0,
-                       (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr)) < 0) {
-                perror("sendto (broadcast) failed");
-            } else {
-                printf("Sent broadcast response on port %d\n", ntohs(broadcast_addr.sin_port));
+            printf("IP address is not configured for interface %d, sending response on UDP broadcast\n", if_idx);
+            if(server_send_broadcast_data(sockfd, client_addr.sin_port, if_idx, (uint8_t*)&value, sizeof(value)) != 0){
+                perror("cannot send broadcast message");
+                exit(1);
             }
         }
     }
