@@ -157,36 +157,45 @@ int server_send_broadcast_data(int sockfd, in_port_t port, int if_idx, const uin
     return 0;
 }
 
-int server_send_unicast_data(int sockfd, struct in_addr sin_addr, in_port_t port, const uint8_t* data, int data_len){
-    struct sockaddr_in addr = {
-        .sin_addr = sin_addr,
-        .sin_family = AF_INET,
-        .sin_port = port
-    };
-    if (sendto(sockfd, data, data_len, 0, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+int server_send_unicast_data(int sockfd, const struct sockaddr_in* client, const uint8_t* data, int data_len){
+    if (sendto(sockfd, data, data_len, 0, (struct sockaddr *)client, sizeof(struct sockaddr_in)) < 0) {
         return 1;
     }
     return 0;
 }
 
-int main() {
-    int sockfd = 0;
-    struct sockaddr_in client_addr = {0};
-    uint8_t client_buffer[BUFFER_SIZE];
-    char client_control[CMSG_SPACE(sizeof(struct in_pktinfo))];
-    char client_ip[INET_ADDRSTRLEN];
-
-    pthread_t tid;
-    struct iovec iov = { .iov_base = client_buffer, .iov_len = sizeof(client_buffer) };
+int server_receive_data(int sockfd, struct sockaddr_in* client, int* if_idx, uint8_t* data, int capacity, int* data_len){
+    uint8_t client_control[CMSG_SPACE(sizeof(struct in_pktinfo))] = {0};
+    struct iovec iov = { .iov_base = data, .iov_len = capacity };
     struct msghdr msg = {
-        .msg_name = &client_addr,
-        .msg_namelen = sizeof(client_addr),
+        .msg_name = client,
+        .msg_namelen = sizeof(struct sockaddr_in),
         .msg_iov = &iov,
         .msg_iovlen = 1,
         .msg_control = client_control,
         .msg_controllen = sizeof(client_control),
     };
 
+    ssize_t n = recvmsg(sockfd, &msg, 0);
+    if (n < 0) {
+        return 1;
+    }
+
+    if(server_extract_if_from_msg(&msg, if_idx) != 0){
+        return 1;
+    }
+
+    *data_len = n;
+    return 0;
+}
+
+int main() {
+    int sockfd = 0;
+    struct sockaddr_in client = {0};
+    uint8_t client_buffer[BUFFER_SIZE] = {0};
+    char client_ip[INET_ADDRSTRLEN] = {0};
+    pthread_t tid;
+    
     if(server_configure_socket(&sockfd) != 0){
         perror("socket configuration failed");
     }
@@ -199,25 +208,18 @@ int main() {
     printf("Listening for UDP messages on port %d...\n", PORT);
 
     while (1) {
-        ssize_t n = recvmsg(sockfd, &msg, 0);
-        if (n < 0) {
-            perror("recvfrom failed");
-            continue;
-        }
-
+        int data_len = 0;
         int if_idx = 0;
-        if(server_extract_if_from_msg(&msg, &if_idx) == 0){
-            printf("Message coming from interface %d\n", if_idx);
-        }else{
-            printf("Message coming from unknown interface\n");
+        if(server_receive_data(sockfd, &client, &if_idx, client_buffer, BUFFER_SIZE, &data_len) != 0){
+            printf("Malformed data received");
             exit(1);
-        }
+        };
 
-        client_buffer[n] = '\0';  // Null-terminate
-        inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+        client_buffer[data_len] = '\0';  // Null-terminate
+        inet_ntop(AF_INET, &(client.sin_addr), client_ip, INET_ADDRSTRLEN);
 
-        printf("Received message from %s:%d: %s\n",
-               client_ip, ntohs(client_addr.sin_port), client_buffer);
+        printf("Received message from %s:%d: %s\tfamily: %d\n",
+               client_ip, ntohs(client.sin_port), client_buffer, client.sin_family);
 
         int value = 0;
         pthread_mutex_lock(&data.lock);
@@ -227,9 +229,7 @@ int main() {
         if(server_if_has_ip_address(sockfd, if_idx) == 0){
             printf("IP address is configured for interface %d, sending response on UDP unicast\n", if_idx);
             // Send response
-            if(server_send_unicast_data(sockfd, client_addr.sin_addr, client_addr.sin_port, (uint8_t*)&value, sizeof(value)))
-            if (sendto(sockfd, &value, sizeof(value), 0,
-                       (struct sockaddr *)&client_addr, sizeof(client_addr)) < 0) {
+            if(server_send_unicast_data(sockfd, &client, (uint8_t*)&value, sizeof(value)) != 0){
                 perror("sendto (response) failed");
                 exit(1);
             }
@@ -237,7 +237,7 @@ int main() {
         // TODO send broadcast only to target interface
         else{
             printf("IP address is not configured for interface %d, sending response on UDP broadcast\n", if_idx);
-            if(server_send_broadcast_data(sockfd, client_addr.sin_port, if_idx, (uint8_t*)&value, sizeof(value)) != 0){
+            if(server_send_broadcast_data(sockfd, client.sin_port, if_idx, (uint8_t*)&value, sizeof(value)) != 0){
                 perror("cannot send broadcast message");
                 exit(1);
             }
